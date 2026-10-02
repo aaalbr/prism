@@ -5,6 +5,18 @@ description: All runtime configuration keys stored in D1, plus Wrangler bindings
 
 # Configuration
 
+## Avatar proxy
+
+The avatar proxy rejects source responses larger than the configured byte
+limit. Its optional cache is disabled by default and can use `KV_CACHE` or D1;
+configure cache mode, TTL, and the per-avatar cache limit in **Admin Panel →
+Avatar Proxy**. D1 entries are removed by the scheduled cleanup job, while KV
+uses its native expiration TTL.
+
+Raster conversion to WebP is optional. Add an `IMAGES` Cloudflare Images
+binding, including in each named Wrangler environment, before enabling it. Safe
+SVG remains SVG and is sanitized rather than rasterized.
+
 Site configuration is stored in the `site_config` D1 table and editable at runtime
 through **Admin → Settings**. No redeployment is needed to change any of these values.
 
@@ -17,20 +29,20 @@ config API.
 
 ## General
 
-| Key                          | Type    | Default                         | Description                                                                |
-| ---------------------------- | ------- | ------------------------------- | -------------------------------------------------------------------------- |
-| `site_name`                  | string  | `"Prism"`                       | Displayed in the browser title and emails                                  |
-| `site_description`           | string  | `"Federated identity platform"` | Shown on the login page                                                    |
-| `site_icon_url`              | string? | `null`                          | URL to a favicon / logo                                                    |
-| `allow_registration`         | boolean | `true`                          | Allow new users to self-register                                           |
-| `invite_only`                | boolean | `false`                         | Require an invite token to register, even when `allow_registration = true` |
-| `require_email_verification` | boolean | `false`                         | Block login until email is verified                                        |
-| `accent_color`               | string  | `"#0078d4"`                     | Primary brand color (hex). Drives FluentUI theme                           |
-| `custom_css`                 | string  | `""`                            | Injected as a `<style>` block on every page                                |
-| `disable_user_create_team`   | boolean | `false`                         | Hide the "New team" button — only admins can create teams                  |
-| `disable_user_create_app`    | boolean | `false`                         | Hide the "New application" button — only admins can create OAuth apps      |
-| `allow_alt_email_login`      | boolean | `true`                          | Let users sign in with any verified secondary email, not just primary      |
-| `initialized`                | boolean | `false`                         | Set to `true` after first-run setup. Do not change manually                |
+| Key                          | Type    | Default                         | Description                                                                                  |
+| ---------------------------- | ------- | ------------------------------- | -------------------------------------------------------------------------------------------- |
+| `site_name`                  | string  | `"Prism"`                       | Displayed in the browser title and emails                                                    |
+| `site_description`           | string  | `"Federated identity platform"` | Shown on the login page                                                                      |
+| `site_icon_url`              | string? | `null`                          | URL to a favicon / logo                                                                      |
+| `allow_registration`         | boolean | `true`                          | Allow new users to self-register                                                             |
+| `invite_only`                | boolean | `false`                         | Require an invite token to register, even when `allow_registration = true`                   |
+| `require_email_verification` | boolean | `false`                         | Block login until email is verified                                                          |
+| `accent_color`               | string  | `"#0078d4"`                     | Primary brand color, selected with the color picker or entered as hex. Drives FluentUI theme |
+| `custom_css`                 | string  | `""`                            | Injected as a `<style>` block on every page                                                  |
+| `disable_user_create_team`   | boolean | `false`                         | Hide the "New team" button — only admins can create teams                                    |
+| `disable_user_create_app`    | boolean | `false`                         | Hide the "New application" button — only admins can create OAuth apps                        |
+| `allow_alt_email_login`      | boolean | `true`                          | Let users sign in with any verified secondary email, not just primary                        |
+| `initialized`                | boolean | `false`                         | Set to `true` after first-run setup. Do not change manually                                  |
 
 ## Legal pages
 

@@ -31,6 +31,7 @@ import { validateImageUrl } from "../lib/imageValidation";
 import { readPage, likePattern } from "../lib/pagination";
 import {
   collectReferencedImageUrls,
+  forgetImageProxyMapping,
   proxyImageUrl,
   registerImageProxyMapping,
   sweepOrphanedImageProxyMappings,
@@ -46,6 +47,7 @@ import {
   recordAudit,
   recordAccountDeletion,
   auditRequestMeta,
+  type AuditInput,
 } from "../lib/audit";
 import {
   dissolveTeam,
@@ -199,6 +201,11 @@ app.patch("/config", async (c) => {
     "smtp_password",
     "custom_css",
     "accent_color",
+    "avatar_proxy_max_source_bytes",
+    "avatar_proxy_cache_mode",
+    "avatar_proxy_cache_ttl_seconds",
+    "avatar_proxy_max_cache_bytes",
+    "avatar_proxy_convert_to_webp",
     "security_contact",
     "security_policy_url",
     "login_error_retention_days",
@@ -260,6 +267,33 @@ app.patch("/config", async (c) => {
   for (const [k, v] of Object.entries(body)) {
     if (allowed.has(k)) updates[k] = v;
   }
+
+  if (
+    updates.avatar_proxy_cache_mode !== undefined &&
+    !["off", "kv", "d1"].includes(String(updates.avatar_proxy_cache_mode))
+  ) {
+    return c.json({ error: "Invalid avatar proxy cache mode" }, 400);
+  }
+  for (const key of [
+    "avatar_proxy_max_source_bytes",
+    "avatar_proxy_cache_ttl_seconds",
+    "avatar_proxy_max_cache_bytes",
+  ]) {
+    const value = updates[key];
+    if (
+      value !== undefined &&
+      (typeof value !== "number" || !Number.isInteger(value) || value <= 0)
+    )
+      return c.json({ error: `${key} must be a positive integer` }, 400);
+  }
+  if (
+    updates.avatar_proxy_convert_to_webp !== undefined &&
+    typeof updates.avatar_proxy_convert_to_webp !== "boolean"
+  )
+    return c.json(
+      { error: "avatar_proxy_convert_to_webp must be a boolean" },
+      400,
+    );
 
   if (updates.site_icon_url && typeof updates.site_icon_url === "string") {
     const imgErr = await validateImageUrl(updates.site_icon_url);
@@ -979,7 +1013,7 @@ app.get("/users", async (c) => {
 
   const [usersResult, countResult] = await Promise.all([
     c.env.DB.prepare(
-      `SELECT u.id, u.email, u.username, u.display_name, u.role, u.email_verified, u.is_active, u.created_at,
+      `SELECT u.id, u.email, u.username, u.display_name, u.avatar_url, u.role, u.email_verified, u.is_active, u.created_at,
               (SELECT COUNT(*) FROM oauth_apps WHERE owner_id = u.id AND team_id IS NULL) as app_count
        FROM users u ${whereClause} ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
     )
@@ -990,8 +1024,19 @@ app.get("/users", async (c) => {
       .first<{ n: number }>(),
   ]);
 
+  const users = await Promise.all(
+    usersResult.results.map(async (user) => ({
+      ...user,
+      avatar_url: await proxyImageUrl(
+        c.env.APP_URL,
+        c.env.DB,
+        typeof user.avatar_url === "string" ? user.avatar_url : null,
+      ),
+    })),
+  );
+
   return c.json({
-    users: usersResult.results,
+    users,
     total: countResult?.n ?? 0,
     page,
     limit,
@@ -1227,10 +1272,38 @@ app.delete("/users/:id", async (c) => {
 
 // Terminate all sessions for a user
 app.delete("/users/:id/sessions", async (c) => {
+  const admin = c.get("user");
   const id = c.req.param("id");
-  await c.env.DB.prepare("DELETE FROM sessions WHERE user_id = ?")
+  const target = await c.env.DB.prepare(
+    "SELECT username FROM users WHERE id = ? AND kind = 'user'",
+  )
+    .bind(id)
+    .first<{ username: string }>();
+  if (!target) return c.json({ error: "User not found" }, 404);
+  const result = await c.env.DB.prepare(
+    "DELETE FROM sessions WHERE user_id = ?",
+  )
     .bind(id)
     .run();
+  const meta = auditRequestMeta(c);
+  const event = {
+    action: "admin.user.sessions_terminate",
+    actorId: admin.id,
+    actorName: admin.username,
+    resourceType: "user",
+    resourceId: id,
+    resourceName: target.username,
+    ip: meta.ip ?? getIp(c),
+    userAgent: meta.userAgent,
+    geo: meta.geo,
+    metadata: { site_admin: true, revoked: result.meta.changes ?? 0 },
+  };
+  c.executionCtx.waitUntil(
+    recordAudit(c.env, c.executionCtx, [
+      { ...event, scope: "platform", scopeId: null },
+      { ...event, scope: "user", scopeId: id },
+    ]),
+  );
   return c.json({ message: "Sessions terminated" });
 });
 
@@ -1350,10 +1423,15 @@ app.patch("/apps/:id", async (c) => {
   }>();
 
   const app = await c.env.DB.prepare(
-    "SELECT id, name FROM oauth_apps WHERE id = ?",
+    "SELECT id, name, owner_id, team_id FROM oauth_apps WHERE id = ?",
   )
     .bind(id)
-    .first<{ id: string; name: string }>();
+    .first<{
+      id: string;
+      name: string;
+      owner_id: string;
+      team_id: string | null;
+    }>();
   if (!app) return c.json({ error: "App not found" }, 404);
 
   const updates: string[] = [];
@@ -1380,16 +1458,26 @@ app.patch("/apps/:id", async (c) => {
   )
     .bind(...values)
     .run();
-  await logAudit(
-    c.env,
-    admin.id,
-    "admin.app.update",
-    "app",
-    id,
-    body,
-    getIp(c),
-    c.executionCtx,
-    { resourceName: app.name },
+  const meta = auditRequestMeta(c);
+  const auditBase = {
+    action: "admin.app.update",
+    actorId: admin.id,
+    actorName: admin.username,
+    resourceType: "app",
+    resourceId: id,
+    resourceName: app.name,
+    ip: meta.ip ?? getIp(c),
+    userAgent: meta.userAgent,
+    geo: meta.geo,
+    metadata: { ...body, site_admin: true },
+  };
+  c.executionCtx.waitUntil(
+    recordAudit(c.env, c.executionCtx, [
+      { ...auditBase, scope: "platform", scopeId: null },
+      app.team_id
+        ? { ...auditBase, scope: "team", scopeId: app.team_id }
+        : { ...auditBase, scope: "user", scopeId: app.owner_id },
+    ]),
   );
   return c.json({ message: "App updated" });
 });
@@ -1869,9 +1957,20 @@ app.get("/image-proxy-status", async (c) => {
   const mapped = await c.env.DB.prepare(
     "SELECT COUNT(*) AS n FROM image_proxy_mappings",
   ).first<{ n: number }>();
+  const cached = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS bytes FROM avatar_proxy_cache WHERE expires_at > ?",
+  )
+    .bind(Math.floor(Date.now() / 1000))
+    .first<{ n: number; bytes: number }>()
+    .catch(() => null);
+  const config = await getConfig(c.env.DB);
   return c.json({
     discovered: urls.size,
     mapped: mapped?.n ?? 0,
+    cached: cached?.n ?? 0,
+    cached_bytes: cached?.bytes ?? 0,
+    cache_mode: config.avatar_proxy_cache_mode,
+    images_binding: !!c.env.IMAGES,
   });
 });
 
@@ -1975,8 +2074,27 @@ app.get("/image-proxy", async (c) => {
       .first<{ n: number }>(),
   ]);
 
+  const resources = await c.env.DB.prepare(
+    `SELECT avatar_url AS url, 'user' AS type, id, display_name AS name FROM users WHERE avatar_url IS NOT NULL
+     UNION ALL SELECT avatar_url, 'team', id, name FROM teams WHERE avatar_url IS NOT NULL
+     UNION ALL SELECT icon_url, 'app', id, name FROM oauth_apps WHERE icon_url IS NOT NULL
+     UNION ALL SELECT icon_url, 'oauth_source', id, name FROM oauth_sources WHERE icon_url IS NOT NULL`,
+  ).all<{ url: string; type: string; id: string; name: string }>();
+  const byUrl = new Map<
+    string,
+    Array<{ type: string; id: string; name: string }>
+  >();
+  for (const resource of resources.results) {
+    const list = byUrl.get(resource.url) ?? [];
+    list.push({ type: resource.type, id: resource.id, name: resource.name });
+    byUrl.set(resource.url, list);
+  }
+
   return c.json({
-    mappings: rows.results,
+    mappings: rows.results.map((row) => ({
+      ...row,
+      resources: byUrl.get(row.url) ?? [],
+    })),
     total: count?.n ?? 0,
     page,
     limit,
@@ -1999,6 +2117,7 @@ app.delete("/image-proxy/:id", async (c) => {
   await c.env.DB.prepare("DELETE FROM image_proxy_mappings WHERE id = ?")
     .bind(id)
     .run();
+  forgetImageProxyMapping(existing.url);
   await logAudit(
     c.env,
     admin.id,
@@ -2374,9 +2493,13 @@ app.get("/restricted-users", async (c) => {
 // ─── Statistics ───────────────────────────────────────────────────────────────
 
 app.get("/stats", async (c) => {
-  const [userCount, appCount, teamCount, domainCount, tokenCount] =
+  const now = Math.floor(Date.now() / 1000);
+  const since = now - 29 * 86400;
+  const [userCount, appCount, teamCount, domainCount, tokenCount, trendRows] =
     await Promise.all([
-      c.env.DB.prepare("SELECT COUNT(*) as n FROM users").first<{
+      c.env.DB.prepare(
+        "SELECT COUNT(*) as n FROM users WHERE kind = 'user'",
+      ).first<{
         n: number;
       }>(),
       c.env.DB.prepare("SELECT COUNT(*) as n FROM oauth_apps").first<{
@@ -2391,15 +2514,56 @@ app.get("/stats", async (c) => {
       c.env.DB.prepare(
         "SELECT COUNT(*) as n FROM oauth_tokens WHERE expires_at > ?",
       )
-        .bind(Math.floor(Date.now() / 1000))
+        .bind(now)
         .first<{ n: number }>(),
+      c.env.DB.prepare(
+        `SELECT kind, day, COUNT(*) AS n FROM (
+           SELECT 'users' AS kind, (created_at / 86400) * 86400 AS day
+             FROM users WHERE kind = 'user' AND created_at >= ?
+           UNION ALL
+           SELECT 'teams', (created_at / 86400) * 86400
+             FROM teams WHERE created_at >= ?
+           UNION ALL
+           SELECT 'apps', (created_at / 86400) * 86400
+             FROM oauth_apps WHERE created_at >= ?
+           UNION ALL
+           SELECT 'verified_domains', (verified_at / 86400) * 86400
+             FROM domains WHERE verified = 1 AND verified_at >= ?
+         ) GROUP BY kind, day ORDER BY day`,
+      )
+        .bind(since, since, since, since)
+        .all<{ kind: string; day: number; n: number }>(),
     ]);
+
+  const firstDay = Math.floor(since / 86400) * 86400;
+  const trends: Record<string, number[]> = {
+    users: Array(30).fill(0),
+    teams: Array(30).fill(0),
+    apps: Array(30).fill(0),
+    verified_domains: Array(30).fill(0),
+  };
+  for (const row of trendRows.results) {
+    const index = Math.floor((row.day - firstDay) / 86400);
+    if (index >= 0 && index < 30 && trends[row.kind]) {
+      trends[row.kind][index] = row.n;
+    }
+  }
+
+  // Older installations may not have the image proxy migration yet. Omit the
+  // proxy metric rather than turning the entire overview into an error state.
+  const proxyCount = await c.env.DB.prepare(
+    "SELECT COUNT(*) as n FROM image_proxy_mappings",
+  )
+    .first<{ n: number }>()
+    .catch(() => null);
   return c.json({
     users: userCount?.n ?? 0,
     apps: appCount?.n ?? 0,
     teams: teamCount?.n ?? 0,
     verified_domains: domainCount?.n ?? 0,
     active_tokens: tokenCount?.n ?? 0,
+    ...(proxyCount ? { proxied_images: proxyCount.n } : {}),
+    trends,
   });
 });
 
@@ -2787,9 +2951,11 @@ async function logAudit(
       .first<{ username: string }>();
     actorName = u?.username ?? null;
   }
-  await recordAudit(env, ctx, {
-    scope: "platform",
-    scopeId: null,
+  const auditedMetadata =
+    metadata && typeof metadata === "object"
+      ? { ...(metadata as Record<string, unknown>), site_admin: true }
+      : { value: metadata, site_admin: true };
+  const base = {
     action,
     actorId: userId,
     actorName,
@@ -2799,8 +2965,13 @@ async function logAudit(
     ip,
     userAgent: extra?.userAgent ?? null,
     geo: extra?.geo ?? null,
-    metadata,
-  });
+    metadata: auditedMetadata,
+  };
+  const events: AuditInput[] = [{ ...base, scope: "platform", scopeId: null }];
+  if (resourceType === "team" && resourceId) {
+    events.push({ ...base, scope: "team", scopeId: resourceId });
+  }
+  await recordAudit(env, ctx, events);
 }
 
 // ─── Site Invites ─────────────────────────────────────────────────────────────

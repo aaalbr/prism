@@ -24,9 +24,16 @@ import {
 } from "@fluentui/react-icons";
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { ApiError } from "../../../lib/api";
 import { useApi } from "../../../lib/api-context";
+import {
+  absoluteInviteExpiry,
+  relativeInviteExpiry,
+  toLocalDateTimeInput,
+  type RelativeExpiryUnit,
+} from "../../../lib/inviteExpiry";
 
 interface InviteDialogProps {
   teamId: string;
@@ -50,15 +57,43 @@ export function InviteDialog({
     role: "member",
     email: "",
     max_uses: "",
-    ttl_hours: "72",
+    expiry_value: "3",
+    expiry_unit: "days" as RelativeExpiryUnit,
   });
+  const [expiryMode, setExpiryMode] = useState<"relative" | "absolute">(
+    "relative",
+  );
+  const [absoluteExpiry, setAbsoluteExpiry] = useState(() => {
+    const date = new Date();
+    date.setDate(date.getDate() + 3);
+    return toLocalDateTimeInput(date);
+  });
+  const [groupIds, setGroupIds] = useState<string[]>([]);
+  const [allowExistingMembers, setAllowExistingMembers] = useState(false);
   const [allowsRegistration, setAllowsRegistration] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createdLink, setCreatedLink] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const groupsQuery = useQuery({
+    queryKey: ["team-groups", teamId],
+    queryFn: () => api.listTeamGroups(teamId),
+    enabled: open,
+  });
 
   const resetState = () => {
-    setForm({ role: "member", email: "", max_uses: "", ttl_hours: "72" });
+    setForm({
+      role: "member",
+      email: "",
+      max_uses: "",
+      expiry_value: "3",
+      expiry_unit: "days",
+    });
+    setExpiryMode("relative");
+    const date = new Date();
+    date.setDate(date.getDate() + 3);
+    setAbsoluteExpiry(toLocalDateTimeInput(date));
+    setGroupIds([]);
+    setAllowExistingMembers(false);
     setAllowsRegistration(false);
     setCreatedLink(null);
     setCopied(false);
@@ -73,11 +108,33 @@ export function InviteDialog({
   const handleCreate = async () => {
     setCreating(true);
     try {
+      const now = new Date();
+      const expiry =
+        expiryMode === "relative"
+          ? relativeInviteExpiry(
+              now,
+              Number(form.expiry_value),
+              form.expiry_unit,
+            )
+          : null;
+      const expiresAt =
+        expiryMode === "relative"
+          ? expiry
+            ? Math.floor(expiry.getTime() / 1000)
+            : null
+          : absoluteInviteExpiry(absoluteExpiry, now);
+      if (!expiresAt) {
+        showMsg("error", t("teams.inviteExpiryInvalid"));
+        return;
+      }
       const res = await api.createTeamInvite(teamId, {
         role: form.role,
         email: form.email.trim() || undefined,
         max_uses: form.max_uses ? parseInt(form.max_uses) : undefined,
-        ttl_hours: form.ttl_hours ? parseInt(form.ttl_hours) : undefined,
+        expires_at: expiresAt,
+        group_ids: groupIds,
+        allow_existing_members:
+          groupIds.length > 0 ? allowExistingMembers : undefined,
         allows_registration: allowsRegistration || undefined,
       });
       await qc.invalidateQueries({ queryKey: ["team-invites", teamId] });
@@ -214,6 +271,51 @@ export function InviteDialog({
                     {t("teams.inviteAllowsRegistrationHint")}
                   </Text>
                 )}
+                {(groupsQuery.data?.enabled ?? false) &&
+                  (groupsQuery.data?.groups.length ?? 0) > 0 && (
+                    <Field
+                      label={t("teams.inviteMemberGroups")}
+                      hint={t("teams.inviteMemberGroupsHint")}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: 12,
+                          alignItems: "center",
+                        }}
+                      >
+                        <Select
+                          value={groupIds[0] ?? ""}
+                          onChange={(_, d) => {
+                            setGroupIds(d.value ? [d.value] : []);
+                            if (!d.value) setAllowExistingMembers(false);
+                          }}
+                          style={{ flex: 1 }}
+                        >
+                          <option value="">
+                            {t("teams.inviteNoMemberGroup")}
+                          </option>
+                          {groupsQuery.data!.groups.map((group) => (
+                            <option
+                              key={group.id}
+                              value={group.id}
+                              disabled={!group.can_assign}
+                            >
+                              {group.name}
+                            </option>
+                          ))}
+                        </Select>
+                        <Checkbox
+                          checked={allowExistingMembers}
+                          disabled={groupIds.length === 0}
+                          label={t("teams.inviteAllowExistingMembers")}
+                          onChange={(_, d) =>
+                            setAllowExistingMembers(!!d.checked)
+                          }
+                        />
+                      </div>
+                    </Field>
+                  )}
                 <Field label={t("teams.maxUses")} hint={t("teams.maxUsesHint")}>
                   <Input
                     type="number"
@@ -224,15 +326,66 @@ export function InviteDialog({
                     placeholder="0"
                   />
                 </Field>
-                <Field label={t("teams.expiresAfter")}>
-                  <Input
-                    type="number"
-                    value={form.ttl_hours}
-                    onChange={(e) =>
-                      setForm((f) => ({ ...f, ttl_hours: e.target.value }))
-                    }
-                    placeholder="72"
-                  />
+                <Field label={t("teams.inviteExpiry")}>
+                  <div
+                    style={{ display: "flex", flexDirection: "column", gap: 8 }}
+                  >
+                    <Select
+                      value={expiryMode}
+                      onChange={(_, d) =>
+                        setExpiryMode(d.value as "relative" | "absolute")
+                      }
+                    >
+                      <option value="relative">
+                        {t("teams.expiryRelative")}
+                      </option>
+                      <option value="absolute">
+                        {t("teams.expiryAbsolute")}
+                      </option>
+                    </Select>
+                    {expiryMode === "relative" ? (
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <Input
+                          type="number"
+                          min={1}
+                          value={form.expiry_value}
+                          onChange={(e) =>
+                            setForm((f) => ({
+                              ...f,
+                              expiry_value: e.target.value,
+                            }))
+                          }
+                        />
+                        <Select
+                          value={form.expiry_unit}
+                          onChange={(_, d) =>
+                            setForm((f) => ({
+                              ...f,
+                              expiry_unit: d.value as RelativeExpiryUnit,
+                            }))
+                          }
+                        >
+                          <option value="hours">
+                            {t("teams.expiryHours")}
+                          </option>
+                          <option value="days">{t("teams.expiryDays")}</option>
+                          <option value="months">
+                            {t("teams.expiryMonths")}
+                          </option>
+                          <option value="years">
+                            {t("teams.expiryYears")}
+                          </option>
+                        </Select>
+                      </div>
+                    ) : (
+                      <Input
+                        type="datetime-local"
+                        step={1}
+                        value={absoluteExpiry}
+                        onChange={(e) => setAbsoluteExpiry(e.target.value)}
+                      />
+                    )}
+                  </div>
                 </Field>
               </div>
             )}

@@ -357,10 +357,10 @@ OAuth 应用密钥为只写字段。`POST /api/apps`、`POST /api/teams/:id/apps
 | `PUT`                     | `/api/teams/:id/members/:userId/groups`              | 覆盖某成员的身份组集合（`{ group_ids: [...] }`）。仅对发生变化的身份组做权限校验                                                                                                                                           |
 | `POST`                    | `/api/teams/:id/transfer-ownership`                  | 把所有权转给另一名成员。站点管理员可从团队外部调用，目标甚至可以尚未加入                                                                                                                                                   |
 | `GET`                     | `/api/teams/:id/invites`                             | 列出有效邀请 token。`?page=`、`?limit=`、`?q=` 邮箱搜索，返回 `total`                                                                                                                                                      |
-| `POST`                    | `/api/teams/:id/invites`                             | 生成邀请 token（可选邮箱锁定 + 最大次数 + 过期）                                                                                                                                                                           |
+| `POST`                    | `/api/teams/:id/invites`                             | 生成邀请 token。支持邮箱锁定、最大次数、`group_ids` 中的一个可选身份组、`allow_existing_members`，以及绝对 Unix `expires_at` 时间戳（必须位于未来，最长 10 年）                                                            |
 | `DELETE`                  | `/api/teams/:id/invites/:token`                      | 撤销邀请                                                                                                                                                                                                                   |
 | `GET`                     | `/api/teams/join/:token`（认证可选）                 | 查看邀请 — 返回团队、门槛、未满足项                                                                                                                                                                                        |
-| `POST`                    | `/api/teams/join/:token`                             | 接受邀请                                                                                                                                                                                                                   |
+| `POST`                    | `/api/teams/join/:token`                             | 接受邀请，通过条件更新占用一次使用次数并分配预设身份组；仅当 `allow_existing_members` 开启时，已有直属成员可加入该身份组                                                                                                   |
 | `GET` / `POST` / `DELETE` | `/api/teams/:id/domains[/:domainId]`                 | 团队域名。`?page=`、`?limit=`、`?q=`，返回 `total`。`GET` 同时返回上级团队拥有的域名作为只读条目，带 `inherited_from` 标记（受 `inherit_team_domains` 控制）                                                               |
 | `POST`                    | `/api/teams/:id/domains/:domainId/verify`            | 触发重新核验                                                                                                                                                                                                               |
 | `POST`                    | `/api/teams/:id/domains/:domainId/to-personal`       | 把已验证域名转回所有者个人空间                                                                                                                                                                                             |
@@ -496,7 +496,7 @@ OAuth scope 版本：
 
 启用子团队且团队所有者开启该分区后（`profile_show_sub_teams`，或站点默认 `default_team_profile_show_sub_teams`），响应包含 `sub_teams[]` 数组 —— 仅包括**自身也已公开**的子团队，避免私密子团队的名字被父团队顺带泄露。若团队的父团队自身也是公开的，响应还会带 `parent_team` 面包屑 `{id, name, avatar_url}`。
 
-## 图片代理
+## 头像代理
 
 ### `GET /api/proxy/image/:id`
 
@@ -659,7 +659,7 @@ OAuth scope 版本：
 | `GET`          | `/api/admin/d1-secrets/status`                                  | bearer 类字段的同上状态                                       |
 | `POST`         | `/api/admin/d1-secrets/migrate`                                 | 哈希尚未迁移的 token / code                                   |
 | `GET / POST`   | `/api/admin/teams-as-users-status` & `/migrate-teams-as-users`  | 为每个团队补建 `kind = 'team'` 用户行                         |
-| `GET / POST`   | `/api/admin/image-proxy-status` & `/migrate-image-proxy`        | 为旧头像/图标补建图片代理映射                                 |
+| `GET / POST`   | `/api/admin/image-proxy-status` & `/migrate-image-proxy`        | 为旧头像/图标补建头像代理映射                                 |
 | `POST`         | `/api/admin/sweep-image-proxy`                                  | 立即清理孤儿映射（同时也会被 cron 调用）                      |
 | `GET / DELETE` | `/api/admin/image-proxy[/:id]`                                  | 浏览 / 删除代理映射                                           |
 | `POST`         | `/api/admin/migrate-recovery-codes`                             | 重新哈希历史明文备用码                                        |

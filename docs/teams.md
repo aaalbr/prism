@@ -22,11 +22,13 @@ member leaving the team.
 There is exactly one owner per team. Transferring ownership is a single,
 audited operation; the previous owner is demoted to co-owner.
 
-**Site administrators** hold owner-level authority on every team — as the site,
-even on teams they belong to or own — and can override the team's own join
-requirements when adding people. The team page says so with a banner, and their
-actions land in the team's audit log marked `site_admin: true`. An admin can
-**switch to normal view** to act as their own membership instead. See
+**Site administrators** can hold owner-level authority on every team — as the
+site, even on teams they belong to or own — and can override the team's own join
+requirements when adding people. Ordinary navigation uses their membership;
+opening a resource from the admin panel explicitly elevates it. A dismissible
+banner identifies either mode, and elevated actions land in both team and
+platform audit logs marked `site_admin: true`. An admin can **switch to normal
+view** to act as their own membership instead. See
 [Admin → Site-admin access to every team](admin.md#site-admin-access-to-every-team).
 
 ## Joining a team
@@ -343,6 +345,19 @@ invite:
   registration here.
 - **always grants `member`**. Someone arriving through a link should never
   begin able to manage the team.
+
+Every team invite can also carry one optional **member group**. The creator may
+select only groups they are allowed to assign. The groups are attached when a
+new member accepts the invite and also when invite-link registration completes.
+An existing **direct** member may accept a group-bearing invite to add those
+group when the invite explicitly allows existing members; an invite without
+that option still reports that they are already a member.
+
+The invite dialog accepts either a relative duration (hours, days, months, or
+years) or an absolute local date and time, including seconds. The browser
+converts either form to an absolute Unix timestamp and sends `expires_at`. The
+server requires that timestamp to be in the future and no more than 10 years
+away.
 
 The link points at `/join/<team-id>?invite=<code>`, not the ordinary
 `/teams/join/<token>` route.

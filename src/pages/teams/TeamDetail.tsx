@@ -89,6 +89,11 @@ const useStyles = makeStyles({
     gap: "16px",
     marginBottom: "24px",
   },
+  tabSearch: {
+    minWidth: "220px",
+    flex: "1 1 220px",
+    height: "32px",
+  },
   form: {
     display: "flex",
     flexDirection: "column",
@@ -185,6 +190,8 @@ export function TeamDetail() {
     setNormalView,
     normalBannerDismissed,
     dismissNormalBanner,
+    adminBannerDismissed,
+    dismissAdminBanner,
   } = useAdminViewStore();
   const { t } = useTranslation();
   const isAdmin = me?.role === "admin";
@@ -421,8 +428,13 @@ export function TeamDetail() {
     }
   };
 
-  const handleCopyInviteLink = async (token: string) => {
-    const link = `${window.location.origin}/teams/join/${token}`;
+  const handleCopyInviteLink = async (
+    token: string,
+    allowsRegistration = false,
+  ) => {
+    const link = allowsRegistration
+      ? `${window.location.origin}/join/${id}?invite=${token}`
+      : `${window.location.origin}/teams/join/${token}`;
     await navigator.clipboard.writeText(link);
     setCopiedToken(token);
     setTimeout(() => setCopiedToken(null), 2000);
@@ -645,11 +657,11 @@ export function TeamDetail() {
 
       {/* Header */}
       <div className={styles.header}>
-        {team.avatar_url ? (
-          <Avatar image={{ src: team.avatar_url }} name={team.name} size={48} />
-        ) : (
-          <Avatar name={team.name} size={48} />
-        )}
+        <Avatar
+          image={team.avatar_url ? { src: team.avatar_url } : undefined}
+          name={team.name}
+          size={48}
+        />
         <div style={{ display: "flex", flexDirection: "column" }}>
           <Title2>{team.name}</Title2>
           {team.description && (
@@ -658,9 +670,6 @@ export function TeamDetail() {
             </Text>
           )}
         </div>
-        <Badge color={ROLE_COLORS[myRole] ?? "subtle"} appearance="filled">
-          {myRole}
-        </Badge>
         {team.inherited_from && (
           <Tooltip
             content={t("teams.inheritedFromAncestor")}
@@ -677,7 +686,7 @@ export function TeamDetail() {
           override. Say where that came from rather than letting the page read
           as though they belong to the team — and, when they have a real
           membership to fall back to, offer to act as it instead. */}
-      {team.site_admin_access && (
+      {team.site_admin_access && !adminBannerDismissed && (
         <MessageBar intent="warning">
           <div className={styles.viewBanner}>
             <span>{t("teams.siteAdminAccess")}</span>
@@ -686,6 +695,14 @@ export function TeamDetail() {
                 {t("teams.siteAdminSwitchToNormal")}
               </Button>
             )}
+            <Button
+              appearance="subtle"
+              size="small"
+              icon={<DismissRegular />}
+              aria-label={t("common.close")}
+              onClick={dismissAdminBanner}
+              style={{ marginLeft: "auto" }}
+            />
           </div>
         </MessageBar>
       )}
@@ -860,7 +877,7 @@ export function TeamDetail() {
                 />
               ) : undefined
             }
-            style={{ minWidth: 220, flex: "1 1 220px" }}
+            className={styles.tabSearch}
           />
 
           <AppsGrid apps={appsData?.apps ?? []} loading={appsLoading} />
@@ -900,7 +917,7 @@ export function TeamDetail() {
                 />
               ) : undefined
             }
-            style={{ minWidth: 220, flex: "1 1 220px" }}
+            className={styles.tabSearch}
           />
 
           <DomainsTable
@@ -952,7 +969,7 @@ export function TeamDetail() {
                 />
               ) : undefined
             }
-            style={{ minWidth: 220, flex: "1 1 220px" }}
+            className={styles.tabSearch}
           />
           {subTeamsLoading && <SkeletonFormCard rows={3} />}
           {!subTeamsLoading && (subTeamsData?.sub_teams ?? []).length === 0 && (
@@ -1069,7 +1086,8 @@ export function TeamDetail() {
                 />
               ) : undefined
             }
-            style={{ minWidth: 220, flex: "1 1 220px", marginBottom: 12 }}
+            className={styles.tabSearch}
+            style={{ marginBottom: 12 }}
           />
 
           {invitesLoading && <SkeletonTableRows rows={3} cols={4} />}
@@ -1105,7 +1123,9 @@ export function TeamDetail() {
                 <TableBody>
                   {(invitesData?.invites ?? []).map((inv: TeamInvite) => {
                     const isHashed = inv.token.startsWith("__HASH_v1__");
-                    const inviteUrl = `${window.location.origin}/teams/join/${inv.token}`;
+                    const inviteUrl = inv.allows_registration
+                      ? `${window.location.origin}/join/${id}?invite=${inv.token}`
+                      : `${window.location.origin}/teams/join/${inv.token}`;
                     const hashPreview = isHashed
                       ? `${inv.token.slice(11, 19)}…`
                       : null;
@@ -1179,13 +1199,30 @@ export function TeamDetail() {
                           )}
                         </TableCell>
                         <TableCell>
-                          <Badge
-                            color={ROLE_COLORS[inv.role] ?? "subtle"}
-                            appearance="filled"
-                            size="small"
+                          <div
+                            style={{
+                              display: "flex",
+                              gap: 4,
+                              flexWrap: "wrap",
+                            }}
                           >
-                            {inv.role}
-                          </Badge>
+                            <Badge
+                              color={ROLE_COLORS[inv.role] ?? "subtle"}
+                              appearance="filled"
+                              size="small"
+                            >
+                              {inv.role}
+                            </Badge>
+                            {inv.groups.map((group) => (
+                              <Badge
+                                key={group.id}
+                                appearance="outline"
+                                size="small"
+                              >
+                                {group.name}
+                              </Badge>
+                            ))}
+                          </div>
                         </TableCell>
                         <TableCell>
                           <Text size={300}>
@@ -1219,7 +1256,10 @@ export function TeamDetail() {
                                   icon={<CopyRegular />}
                                   size="small"
                                   onClick={() =>
-                                    handleCopyInviteLink(inv.token)
+                                    handleCopyInviteLink(
+                                      inv.token,
+                                      inv.allows_registration,
+                                    )
                                   }
                                 />
                               </Tooltip>

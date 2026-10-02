@@ -180,8 +180,8 @@ async function performRequest<T>(
 
   // A site admin who has switched to "normal view" asks the worker to drop
   // their site-admin override and treat team requests as their own membership.
-  // The flag is session-only and defaults off (see store/adminView), so this
-  // header is absent for everyone else and on a fresh SSR pass.
+  // The flag is session-only and defaults on (see store/adminView). Admin-panel
+  // navigation turns it off before opening a team/app resource.
   if (options.isNormalView?.()) headers["X-Prism-Team-View"] = "member";
 
   // The browser client uses global fetch. SSR injects a request-bound
@@ -1271,12 +1271,14 @@ const buildApi = (request: ApiRequest, getToken: () => string | undefined) => ({
       getToken(),
     ),
   adminImageProxyStatus: () =>
-    request<{ discovered: number; mapped: number }>(
-      "GET",
-      "/admin/image-proxy-status",
-      undefined,
-      getToken(),
-    ),
+    request<{
+      discovered: number;
+      mapped: number;
+      cached: number;
+      cached_bytes: number;
+      cache_mode: "off" | "kv" | "d1";
+      images_binding: boolean;
+    }>("GET", "/admin/image-proxy-status", undefined, getToken()),
   adminMigrateImageProxy: () =>
     request<{ registered: number }>(
       "POST",
@@ -1300,6 +1302,7 @@ const buildApi = (request: ApiRequest, getToken: () => string | undefined) => ({
         created_at: number;
         created_by_username: string | null;
         created_by_display_name: string | null;
+        resources: Array<{ type: string; id: string; name: string }>;
       }[];
       total: number;
       page: number;
@@ -1839,7 +1842,9 @@ const buildApi = (request: ApiRequest, getToken: () => string | undefined) => ({
       role?: string;
       email?: string;
       max_uses?: number;
-      ttl_hours?: number;
+      expires_at: number;
+      group_ids?: string[];
+      allow_existing_members?: boolean;
       /** Makes the link able to create accounts. Requires a finite max_uses
        *  and forces the granted role to `member`. */
       allows_registration?: boolean;
@@ -2636,10 +2641,7 @@ export const api = createApiClient({
  *  concrete "global"/"china"; the client-side modes are resolved in the browser
  *  by the Captcha component. Absent on older servers → treated as "global". */
 export type TurnstileEndpointDirective =
-  | "global"
-  | "china"
-  | "client_language"
-  | "client_region";
+  "global" | "china" | "client_language" | "client_region";
 
 /** Which of the two configured Turnstile widgets minted a token. Sent back
  *  with the token so the server verifies it against the matching secret — the
@@ -2647,13 +2649,7 @@ export type TurnstileEndpointDirective =
 export type TurnstileVariant = "global" | "china";
 
 export type CaptchaProvider =
-  | "none"
-  | "turnstile"
-  | "hcaptcha"
-  | "recaptcha"
-  | "pow"
-  | "geetest"
-  | "cap";
+  "none" | "turnstile" | "hcaptcha" | "recaptcha" | "pow" | "geetest" | "cap";
 
 export type CapMode = "embedded" | "external";
 
@@ -3259,6 +3255,16 @@ export interface TeamInvite {
   expires_at: number;
   created_at: number;
   created_by_username: string;
+  allows_registration: boolean;
+  groups: InviteMemberGroup[];
+  allow_existing_members: boolean;
+}
+
+export interface InviteMemberGroup {
+  id: string;
+  slug: string;
+  name: string;
+  color: string | null;
 }
 
 export interface TeamInviteInfo {
@@ -3271,6 +3277,9 @@ export interface TeamInviteInfo {
   };
   role: string;
   email: string | null;
+  groups: InviteMemberGroup[];
+  allow_existing_members: boolean;
+  can_apply_groups: boolean;
   expires_at: number;
   user: { id: string; username: string } | null;
   already_member: boolean;
@@ -3553,6 +3562,7 @@ export interface AdminTeamInvite {
   created_by_username: string | null;
   /** True when this invite mints accounts rather than adding existing ones. */
   allows_registration: boolean;
+  groups: InviteMemberGroup[];
 }
 
 export interface AdminSession {
@@ -3946,9 +3956,17 @@ export interface DeviceVerifyInfo {
 
 export interface AdminStats {
   users: number;
+  teams: number;
   apps: number;
   verified_domains: number;
   active_tokens: number;
+  proxied_images?: number;
+  trends: {
+    users: number[];
+    teams: number[];
+    apps: number[];
+    verified_domains: number[];
+  };
 }
 
 export interface AdminSecretsStatus {
@@ -4101,8 +4119,7 @@ export type NotificationRuleSendChannel =
   | { kind: "discord"; connection_id: string; level: NotificationLevel };
 
 export type NotificationRuleAction =
-  | { type: "drop" }
-  | { type: "send"; channels: NotificationRuleSendChannel[] };
+  { type: "drop" } | { type: "send"; channels: NotificationRuleSendChannel[] };
 
 export interface NotificationRulesetRule {
   id: string;

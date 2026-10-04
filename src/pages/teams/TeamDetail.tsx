@@ -89,9 +89,21 @@ const useStyles = makeStyles({
     gap: "16px",
     marginBottom: "24px",
   },
-  tabSearch: {
+  tabToolbar: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    marginBottom: "12px",
+    flexWrap: "wrap",
+  },
+  toolbarSearch: {
     minWidth: "220px",
     flex: "1 1 220px",
+    height: "32px",
+  },
+  standaloneSearch: {
+    width: "100%",
+    minWidth: 0,
     height: "32px",
   },
   form: {
@@ -579,6 +591,25 @@ export function TeamDetail() {
     }
   };
 
+  const handleRestrictMemberListChange = async (value: boolean) => {
+    if (!id) return;
+    setSavingRequirement("restrict_member_list_for_members");
+    try {
+      await api.updateTeam(id, { restrict_member_list_for_members: value });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["team", id] }),
+        qc.invalidateQueries({ queryKey: ["team-members", id] }),
+      ]);
+    } catch (err) {
+      showMsg(
+        "error",
+        err instanceof ApiError ? err.message : t("teams.failedUpdateTeam"),
+      );
+    } finally {
+      setSavingRequirement(null);
+    }
+  };
+
   const handleDeleteTeam = async () => {
     if (!id) return;
     try {
@@ -790,19 +821,6 @@ export function TeamDetail() {
       {/* Members tab */}
       {tab === "members" && (
         <div style={{ display: "flex", flexDirection: "column", flex: 1 }}>
-          {canManage && (
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "flex-end",
-                gap: 8,
-                marginBottom: 12,
-              }}
-            >
-              <AddMemberDialog teamId={id!} showMsg={showMsg} />
-            </div>
-          )}
-
           <MembersTable
             teamId={id!}
             members={members}
@@ -812,7 +830,14 @@ export function TeamDetail() {
             isCoOwnerOrAbove={isCoOwnerOrAbove}
             myRole={myRole}
             meId={me?.id}
+            normalView={normalView}
             groupsEnabled={team.enable_groups}
+            restrictMemberListForMembers={team.restrict_member_list_for_members}
+            toolbarActions={
+              canManage ? (
+                <AddMemberDialog teamId={id!} showMsg={showMsg} />
+              ) : undefined
+            }
             onChangeRole={handleChangeRole}
             onRemoveMember={handleRemoveMember}
             onTransferOwnership={handleTransferOwnership}
@@ -843,42 +868,43 @@ export function TeamDetail() {
       {/* Apps tab */}
       {tab === "apps" && (
         <div style={{ display: "flex", flexDirection: "column", flex: 1 }}>
-          {canManage && (
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "flex-end",
-                gap: 8,
-                marginBottom: 12,
-              }}
-            >
-              <MigrateAppDialog
-                teamId={id!}
-                personalApps={personalApps}
-                showMsg={showMsg}
-              />
-              <NewTeamAppDialog teamId={id!} showMsg={showMsg} />
-            </div>
-          )}
-
-          <Input
-            value={appsQuery}
-            onChange={(e) => setAppsQuery(e.target.value)}
-            placeholder={t("teams.searchTeamAppsPlaceholder")}
-            contentBefore={<SearchRegular />}
-            contentAfter={
-              appsQuery ? (
-                <Button
-                  appearance="transparent"
-                  size="small"
-                  icon={<DismissRegular />}
-                  aria-label={t("common.clear")}
-                  onClick={() => setAppsQuery("")}
+          <div className={styles.tabToolbar}>
+            <Input
+              value={appsQuery}
+              onChange={(e) => setAppsQuery(e.target.value)}
+              placeholder={t("teams.searchTeamAppsPlaceholder")}
+              contentBefore={<SearchRegular />}
+              contentAfter={
+                appsQuery ? (
+                  <Button
+                    appearance="transparent"
+                    size="small"
+                    icon={<DismissRegular />}
+                    aria-label={t("common.clear")}
+                    onClick={() => setAppsQuery("")}
+                  />
+                ) : undefined
+              }
+              className={styles.toolbarSearch}
+            />
+            {canManage && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  marginLeft: "auto",
+                }}
+              >
+                <MigrateAppDialog
+                  teamId={id!}
+                  personalApps={personalApps}
+                  showMsg={showMsg}
                 />
-              ) : undefined
-            }
-            className={styles.tabSearch}
-          />
+                <NewTeamAppDialog teamId={id!} showMsg={showMsg} />
+              </div>
+            )}
+          </div>
 
           <AppsGrid apps={appsData?.apps ?? []} loading={appsLoading} />
 
@@ -917,7 +943,7 @@ export function TeamDetail() {
                 />
               ) : undefined
             }
-            className={styles.tabSearch}
+            className={styles.standaloneSearch}
           />
 
           <DomainsTable
@@ -948,29 +974,31 @@ export function TeamDetail() {
           <MessageBar intent="info">
             <MarkdownText source={t("teams.subTeamsDesc")} />
           </MessageBar>
-          {canManage && (
-            <div style={{ display: "flex", justifyContent: "flex-end" }}>
-              <CreateSubTeamDialog parentTeamId={id!} showMsg={showMsg} />
-            </div>
-          )}
-          <Input
-            value={subTeamsQuery}
-            onChange={(e) => setSubTeamsQuery(e.target.value)}
-            placeholder={t("teams.searchSubTeamsPlaceholder")}
-            contentBefore={<SearchRegular />}
-            contentAfter={
-              subTeamsQuery ? (
-                <Button
-                  appearance="transparent"
-                  size="small"
-                  icon={<DismissRegular />}
-                  aria-label={t("common.clear")}
-                  onClick={() => setSubTeamsQuery("")}
-                />
-              ) : undefined
-            }
-            className={styles.tabSearch}
-          />
+          <div className={styles.tabToolbar}>
+            <Input
+              value={subTeamsQuery}
+              onChange={(e) => setSubTeamsQuery(e.target.value)}
+              placeholder={t("teams.searchSubTeamsPlaceholder")}
+              contentBefore={<SearchRegular />}
+              contentAfter={
+                subTeamsQuery ? (
+                  <Button
+                    appearance="transparent"
+                    size="small"
+                    icon={<DismissRegular />}
+                    aria-label={t("common.clear")}
+                    onClick={() => setSubTeamsQuery("")}
+                  />
+                ) : undefined
+              }
+              className={styles.toolbarSearch}
+            />
+            {canManage && (
+              <div style={{ display: "flex", marginLeft: "auto" }}>
+                <CreateSubTeamDialog parentTeamId={id!} showMsg={showMsg} />
+              </div>
+            )}
+          </div>
           {subTeamsLoading && <SkeletonFormCard rows={3} />}
           {!subTeamsLoading && (subTeamsData?.sub_teams ?? []).length === 0 && (
             <EmptyState
@@ -1053,42 +1081,36 @@ export function TeamDetail() {
       {/* Invites tab */}
       {tab === "invites" && canManage && (
         <div style={{ display: "flex", flexDirection: "column", flex: 1 }}>
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "flex-end",
-              marginBottom: 12,
-            }}
-          >
-            <InviteDialog
-              teamId={id!}
-              canRegister={
-                team.invite_registration_granted &&
-                team.invite_registration_enabled
+          <div className={styles.tabToolbar}>
+            <Input
+              value={invitesQuery}
+              onChange={(e) => setInvitesQuery(e.target.value)}
+              placeholder={t("teams.searchInvitesPlaceholder")}
+              contentBefore={<SearchRegular />}
+              contentAfter={
+                invitesQuery ? (
+                  <Button
+                    appearance="transparent"
+                    size="small"
+                    icon={<DismissRegular />}
+                    aria-label={t("common.clear")}
+                    onClick={() => setInvitesQuery("")}
+                  />
+                ) : undefined
               }
-              showMsg={showMsg}
+              className={styles.toolbarSearch}
             />
+            <div style={{ display: "flex", marginLeft: "auto" }}>
+              <InviteDialog
+                teamId={id!}
+                canRegister={
+                  team.invite_registration_granted &&
+                  team.invite_registration_enabled
+                }
+                showMsg={showMsg}
+              />
+            </div>
           </div>
-
-          <Input
-            value={invitesQuery}
-            onChange={(e) => setInvitesQuery(e.target.value)}
-            placeholder={t("teams.searchInvitesPlaceholder")}
-            contentBefore={<SearchRegular />}
-            contentAfter={
-              invitesQuery ? (
-                <Button
-                  appearance="transparent"
-                  size="small"
-                  icon={<DismissRegular />}
-                  aria-label={t("common.clear")}
-                  onClick={() => setInvitesQuery("")}
-                />
-              ) : undefined
-            }
-            className={styles.tabSearch}
-            style={{ marginBottom: 12 }}
-          />
 
           {invitesLoading && <SkeletonTableRows rows={3} cols={4} />}
 
@@ -1414,6 +1436,43 @@ export function TeamDetail() {
                 </div>
               );
             })()}
+
+          {isCoOwnerOrAbove && (
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 12,
+                padding: 16,
+                border: `1px solid ${tokens.colorNeutralStroke1}`,
+                borderRadius: 8,
+              }}
+            >
+              <div>
+                <Text weight="semibold" size={400} block>
+                  {t("teams.memberListVisibilityTitle")}
+                </Text>
+                <Text
+                  size={200}
+                  block
+                  style={{
+                    color: tokens.colorNeutralForeground3,
+                    marginTop: 4,
+                  }}
+                >
+                  {t("teams.memberListVisibilityDesc")}
+                </Text>
+              </div>
+              <Switch
+                label={t("teams.restrictMemberListForMembers")}
+                checked={team.restrict_member_list_for_members}
+                disabled={
+                  savingRequirement === "restrict_member_list_for_members"
+                }
+                onChange={(_, d) => handleRestrictMemberListChange(d.checked)}
+              />
+            </div>
+          )}
 
           {isOwner && (
             <div

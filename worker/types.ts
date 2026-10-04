@@ -19,6 +19,9 @@ export interface UserRow {
   alt_email_login: number | null;
   access_token_ttl_minutes: number | null;
   refresh_token_ttl_days: number | null;
+  /** 1 = send notification when OAuth app is automatically authorized via
+   *  remembered auto-authorization (skipping consent UI); 0 (default) = suppress. */
+  notify_on_auto_authorization: number;
   /** 1 (default) = a successful GPG signature still walks the TOTP gate when
    *  the account has an enrolled authenticator; 0 = trust the signature on
    *  its own and skip the TOTP prompt. Only affects gpg-login. */
@@ -204,6 +207,9 @@ export interface TeamRow {
   /** 0 = a normal (unrestricted) account may not join via invite link.
    *  Direct adds by an admin bypass this, so hiring staff still works. */
   allow_normal_user_join: number;
+  /** 1 = members can only see owners, co-owners, admins, and themselves in
+   *  team member lists. Owner/co-owner controlled. Default 0. */
+  restrict_member_list_for_members: number;
   /** Set when a site admin begins the staged dissolution. The row survives
    *  until the reaper finishes clearing accounts — deleting it earlier would
    *  leave origin_team_id dangling with no way to find the work. */

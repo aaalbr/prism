@@ -597,7 +597,7 @@ app.get("/consents", requireAuth, async (c) => {
 
   const [consentRows, countRow, tokenRows] = await Promise.all([
     c.env.DB.prepare(
-      `SELECT oc.client_id, oc.scopes, oc.granted_at,
+      `SELECT oc.client_id, oc.scopes, oc.granted_at, oc.auto_authorize,
               oa.name, oa.description, oa.icon_url, oa.website_url,
               oa.owner_id, oa.team_id, oa.redirect_uris
        FROM oauth_consents oc
@@ -610,6 +610,7 @@ app.get("/consents", requireAuth, async (c) => {
         client_id: string;
         scopes: string;
         granted_at: number;
+        auto_authorize: number;
         name: string;
         description: string;
         icon_url: string | null;
@@ -671,6 +672,7 @@ app.get("/consents", requireAuth, async (c) => {
         client_id: r.client_id,
         scopes: JSON.parse(r.scopes) as string[],
         granted_at: r.granted_at,
+        auto_authorize: r.auto_authorize === 1,
         app: {
           name: r.name,
           description: r.description,
@@ -774,6 +776,31 @@ app.delete("/consents/:client_id", requireAuth, async (c) => {
   }
 
   return c.json({ message: "Access revoked" });
+});
+
+// PATCH /api/oauth/consents/:clientId — update consent settings, e.g. disable auto_authorize
+app.patch("/consents/:clientId", requireAuth, async (c) => {
+  const user = c.get("user");
+  const clientId = c.req.param("clientId");
+  const body = await c.req.json<{ auto_authorize?: boolean }>();
+
+  if (body.auto_authorize !== undefined) {
+    if (body.auto_authorize) {
+      return c.json(
+        {
+          error: "Auto-authorization can only be enabled during authorization",
+        },
+        400,
+      );
+    }
+    await c.env.DB.prepare(
+      "UPDATE oauth_consents SET auto_authorize = 0 WHERE user_id = ? AND client_id = ?",
+    )
+      .bind(user.id, clientId)
+      .run();
+  }
+
+  return c.json({ message: "Consent updated" });
 });
 
 /** Check if the given user is allowed by the app's access whitelist rules.
@@ -1001,15 +1028,16 @@ app.get("/app-info", optionalAuth, async (c) => {
   // a "Log back in" affordance — replacing prior tokens with a fresh one —
   // when the requested permissions exactly match the previous grant.
   let existingConsentScopes: string[] | null = null;
+  let existingConsentAutoAuthorize = false;
   let existingTokenCount = 0;
   if (currentUser) {
     const nowSec = Math.floor(Date.now() / 1000);
     const [consentRow, tokenCountRow] = await Promise.all([
       c.env.DB.prepare(
-        "SELECT scopes FROM oauth_consents WHERE user_id = ? AND client_id = ?",
+        "SELECT scopes, auto_authorize FROM oauth_consents WHERE user_id = ? AND client_id = ?",
       )
         .bind(currentUser.id, oauthApp.client_id)
-        .first<{ scopes: string }>(),
+        .first<{ scopes: string; auto_authorize: number }>(),
       c.env.DB.prepare(
         "SELECT COUNT(*) AS n FROM oauth_tokens WHERE user_id = ? AND client_id = ? AND expires_at > ?",
       )
@@ -1017,6 +1045,7 @@ app.get("/app-info", optionalAuth, async (c) => {
         .first<{ n: number }>(),
     ]);
     if (consentRow) {
+      existingConsentAutoAuthorize = consentRow.auto_authorize === 1;
       try {
         const parsed = JSON.parse(consentRow.scopes);
         if (Array.isArray(parsed)) {
@@ -1059,14 +1088,32 @@ app.get("/app-info", optionalAuth, async (c) => {
     requestedAcrs.length > 0 &&
     (sessionAcr === null || !requestedAcrs.includes(sessionAcr));
   const reauthRequired = prompt === "login" || staleByMaxAge || acrUnsatisfied;
-  // Does the prior consent already cover every currently-requested scope?
-  const priorCovers =
+  // Exact match between requested effective scopes and existing remembered consent
+  const exactConsentMatch =
     existingConsentScopes != null &&
-    scopes.every((s) => existingConsentScopes!.includes(s));
+    existingConsentScopes.length === scopes.length &&
+    new Set(existingConsentScopes).size === scopes.length &&
+    existingConsentScopes.every((s) => scopes.includes(s));
+
+  // Remembered auto-authorization eligibility (requires auto_authorize flag and exact scope match)
+  const autoAuthorizeEligible =
+    !oauthApp.is_first_party &&
+    !hasSiteScopes(scopes) &&
+    !needsTeamGrant &&
+    rejected.length === 0 &&
+    prompt !== "consent" &&
+    !reauthRequired &&
+    existingConsentAutoAuthorize &&
+    exactConsentMatch;
+
   let promptNoneError: string | null = null;
   if (prompt === "none") {
     if (!currentUser || reauthRequired) promptNoneError = "login_required";
-    else if (!priorCovers) promptNoneError = "consent_required";
+    else if (
+      !oauthApp.is_first_party &&
+      (!existingConsentAutoAuthorize || !exactConsentMatch)
+    )
+      promptNoneError = "consent_required";
   }
 
   return c.json({
@@ -1084,7 +1131,8 @@ app.get("/app-info", optionalAuth, async (c) => {
     max_age: maxAge,
     reauth_required: reauthRequired,
     prompt_none_error: promptNoneError,
-    prior_consent_covers: priorCovers,
+    prior_consent_covers: existingConsentAutoAuthorize && exactConsentMatch,
+    auto_authorize_eligible: autoAuthorizeEligible,
     user: c.get("user") ?? null,
     requires_site_grant: hasSiteScopes(scopes),
     site_scope_confirm_phrase: hasSiteScopes(scopes)
@@ -1113,6 +1161,7 @@ app.post("/authorize", requireAuth, async (c) => {
     code_challenge_method?: string;
     nonce?: string;
     action: "approve" | "deny";
+    authorization_mode?: "once" | "always";
     totp_code?: string;
     passkey_verify_token?: string;
     confirm_text?: string;
@@ -1352,6 +1401,45 @@ app.post("/authorize", requireAuth, async (c) => {
       .run();
   }
 
+  const siteScopes = boundScopes.filter((s) => SITE_SCOPES.has(s));
+
+  // Look up prior consent before inserting/updating
+  const priorConsentRow = await c.env.DB.prepare(
+    "SELECT scopes, auto_authorize FROM oauth_consents WHERE user_id = ? AND client_id = ?",
+  )
+    .bind(user.id, body.client_id)
+    .first<{ scopes: string; auto_authorize: number }>();
+
+  let priorScopes: string[] = [];
+  if (priorConsentRow) {
+    try {
+      const parsed = JSON.parse(priorConsentRow.scopes);
+      if (Array.isArray(parsed)) {
+        priorScopes = parsed.filter((s): s is string => typeof s === "string");
+      }
+    } catch {
+      priorScopes = [];
+    }
+  }
+
+  const isExactConsentMatch =
+    priorConsentRow != null &&
+    priorScopes.length === boundScopes.length &&
+    new Set(priorScopes).size === priorScopes.length &&
+    priorScopes.every((s) => boundScopes.includes(s));
+
+  // Determine whether this approval is server-side auto-authorized:
+  // - First-party apps skip consent UI automatically
+  // - Remembered auto-authorization: prior consent had auto_authorize = 1,
+  //   exact scope match, no site scopes, no unbound team grant, and prompt != consent
+  const isAutoAuthorized =
+    oauthApp.is_first_party ||
+    (priorConsentRow?.auto_authorize === 1 &&
+      isExactConsentMatch &&
+      siteScopes.length === 0 &&
+      !body.team_id &&
+      body.prompt !== "consent");
+
   // "Log back in" — when the user explicitly opts in and the scopes being
   // granted match an existing consent exactly, drop the old tokens so a single
   // fresh token replaces them. The actual DELETE runs after the new auth code
@@ -1360,28 +1448,7 @@ app.post("/authorize", requireAuth, async (c) => {
   // silently fall through to the normal flow without touching old tokens.
   let shouldRevokeOldTokens = false;
   if (body.revoke_existing_tokens && body.action === "approve") {
-    const priorConsent = await c.env.DB.prepare(
-      "SELECT scopes FROM oauth_consents WHERE user_id = ? AND client_id = ?",
-    )
-      .bind(user.id, body.client_id)
-      .first<{ scopes: string }>();
-    if (priorConsent) {
-      let priorScopes: string[] = [];
-      try {
-        const parsed = JSON.parse(priorConsent.scopes);
-        if (Array.isArray(parsed)) {
-          priorScopes = parsed.filter(
-            (s): s is string => typeof s === "string",
-          );
-        }
-      } catch {
-        priorScopes = [];
-      }
-      shouldRevokeOldTokens =
-        priorScopes.length === boundScopes.length &&
-        new Set(priorScopes).size === priorScopes.length &&
-        priorScopes.every((s) => boundScopes.includes(s));
-    }
+    shouldRevokeOldTokens = isExactConsentMatch;
   }
 
   // Store consent
@@ -1413,14 +1480,46 @@ app.post("/authorize", requireAuth, async (c) => {
     );
   }
 
-  const siteScopes = boundScopes.filter((s) => SITE_SCOPES.has(s));
-  await c.env.DB.prepare(
-    `INSERT INTO oauth_consents (id, user_id, client_id, scopes, granted_at)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(user_id, client_id) DO UPDATE SET scopes = excluded.scopes, granted_at = excluded.granted_at`,
-  )
-    .bind(randomId(), user.id, body.client_id, JSON.stringify(boundScopes), now)
-    .run();
+  const autoAuthorizeFlag =
+    body.authorization_mode === "always" &&
+    !oauthApp.is_first_party &&
+    siteScopes.length === 0 &&
+    !body.team_id
+      ? 1
+      : body.authorization_mode === "once"
+        ? 0
+        : undefined;
+
+  if (autoAuthorizeFlag !== undefined) {
+    await c.env.DB.prepare(
+      `INSERT INTO oauth_consents (id, user_id, client_id, scopes, granted_at, auto_authorize)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, client_id) DO UPDATE SET scopes = excluded.scopes, granted_at = excluded.granted_at, auto_authorize = excluded.auto_authorize`,
+    )
+      .bind(
+        randomId(),
+        user.id,
+        body.client_id,
+        JSON.stringify(boundScopes),
+        now,
+        autoAuthorizeFlag,
+      )
+      .run();
+  } else {
+    await c.env.DB.prepare(
+      `INSERT INTO oauth_consents (id, user_id, client_id, scopes, granted_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, client_id) DO UPDATE SET scopes = excluded.scopes, granted_at = excluded.granted_at`,
+    )
+      .bind(
+        randomId(),
+        user.id,
+        body.client_id,
+        JSON.stringify(boundScopes),
+        now,
+      )
+      .run();
+  }
 
   if (siteScopes.length > 0) {
     await c.env.DB.prepare(
@@ -1438,19 +1537,38 @@ app.post("/authorize", requireAuth, async (c) => {
       .run();
   }
 
-  c.executionCtx.waitUntil(
-    deliverUserEmailNotifications(
-      c.env,
-      user.id,
-      "oauth.consent_granted",
-      {
-        app_name: oauthApp.name,
-        scopes: boundScopes,
-        ...notificationActorMetaFromHeaders(c.req.raw.headers),
-      },
-      c.env.APP_URL,
-    ).catch(() => {}),
-  );
+  // Send notification:
+  // - Always for manual authorization
+  // - For auto-authorization (skipping consent UI), only if the user opted in via notify_on_auto_authorization
+  // Note: isAutoAuthorized is derived on the server from DB consent records and request state,
+  // preventing client-side spoofing.
+  let shouldNotify = !isAutoAuthorized;
+  if (isAutoAuthorized && !oauthApp.is_first_party) {
+    const u = await c.env.DB.prepare(
+      "SELECT notify_on_auto_authorization FROM users WHERE id = ?",
+    )
+      .bind(user.id)
+      .first<{ notify_on_auto_authorization: number }>();
+    if (u?.notify_on_auto_authorization === 1) {
+      shouldNotify = true;
+    }
+  }
+
+  if (shouldNotify) {
+    c.executionCtx.waitUntil(
+      deliverUserEmailNotifications(
+        c.env,
+        user.id,
+        "oauth.consent_granted",
+        {
+          app_name: oauthApp.name,
+          scopes: boundScopes,
+          ...notificationActorMetaFromHeaders(c.req.raw.headers),
+        },
+        c.env.APP_URL,
+      ).catch(() => {}),
+    );
+  }
 
   // Issue authorization code (10 minute TTL). Stored as keyed-HMAC hash
   // so a D1 leak doesn't surrender redeemable codes.
@@ -5505,12 +5623,26 @@ app.get("/me/team/:teamId/members", async (c) => {
   if (!actorRole || !hasRole(actorRole, "member"))
     return c.json({ error: "actor is no longer a team member" }, 403);
 
+  const team = await c.env.DB.prepare(
+    "SELECT restrict_member_list_for_members FROM teams WHERE id = ?",
+  )
+    .bind(teamId)
+    .first<{ restrict_member_list_for_members: number }>();
+
+  let memberFilter = "";
+  const filterArgs: unknown[] = [teamId];
+  if (team?.restrict_member_list_for_members === 1 && actorRole === "member") {
+    memberFilter =
+      " AND (tm.role IN ('owner', 'co-owner', 'admin') OR tm.user_id = ?)";
+    filterArgs.push(resolved.userId);
+  }
+
   const [{ results }, groups] = await Promise.all([
     c.env.DB.prepare(
       `SELECT tm.user_id, tm.role, tm.joined_at
-     FROM team_members tm WHERE tm.team_id = ? ORDER BY tm.joined_at ASC`,
+     FROM team_members tm WHERE tm.team_id = ?${memberFilter} ORDER BY tm.joined_at ASC`,
     )
-      .bind(teamId)
+      .bind(...filterArgs)
       .all<{ user_id: string; role: string; joined_at: number }>(),
     // Empty for every member when the team has groups switched off.
     getGroupsForTeamMembers(c.env.DB, teamId),
@@ -5531,12 +5663,30 @@ app.get("/me/team/:teamId/members/:userId/profile", async (c) => {
   const resolved = await resolveTeamToken(c, teamId, "member:profile:read");
   if (!resolved) return c.json({ error: "insufficient_scope" }, 403);
 
+  const actorRole = await effectiveTeamRole(c.env.DB, teamId, resolved);
+  if (!actorRole || !hasRole(actorRole, "member"))
+    return c.json({ error: "actor is no longer a team member" }, 403);
+
+  const team = await c.env.DB.prepare(
+    "SELECT restrict_member_list_for_members FROM teams WHERE id = ?",
+  )
+    .bind(teamId)
+    .first<{ restrict_member_list_for_members: number }>();
+
+  let visibilityFilter = "";
+  const filterArgs: unknown[] = [teamId, userId];
+  if (team?.restrict_member_list_for_members === 1 && actorRole === "member") {
+    visibilityFilter =
+      " AND (tm.role IN ('owner', 'co-owner', 'admin') OR tm.user_id = ?)";
+    filterArgs.push(resolved.userId);
+  }
+
   const row = await c.env.DB.prepare(
     `SELECT u.id, u.username, u.display_name, u.avatar_url, tm.role, tm.joined_at
      FROM team_members tm JOIN users u ON u.id = tm.user_id
-     WHERE tm.team_id = ? AND tm.user_id = ?`,
+     WHERE tm.team_id = ? AND tm.user_id = ?${visibilityFilter}`,
   )
-    .bind(teamId, userId)
+    .bind(...filterArgs)
     .first<{
       id: string;
       username: string;

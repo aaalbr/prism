@@ -152,6 +152,9 @@ function serializeTeamRow(team: TeamRow) {
       ? (JSON.parse(team.invite_registration_exemptions) as unknown)
       : {},
     allow_normal_user_join: toBool(team.allow_normal_user_join),
+    restrict_member_list_for_members: toBool(
+      team.restrict_member_list_for_members,
+    ),
     dissolving_at: team.dissolving_at,
     // Send the parsed overrides, not the raw blob — the client shouldn't
     // have to know the storage format to render the settings toggles.
@@ -1320,18 +1323,28 @@ app.get("/:id", async (c) => {
   const eff = await teamAuthority(c, id);
   if (!eff) return c.json({ error: "Not found" }, 404);
 
+  const team = await c.env.DB.prepare("SELECT * FROM teams WHERE id = ?")
+    .bind(id)
+    .first<TeamRow>();
+  if (!team) return c.json({ error: "Not found" }, 404);
+
+  const viewerUserId =
+    team.restrict_member_list_for_members === 1 &&
+    eff.role === "member" &&
+    !eff.elevated
+      ? actorFor(c).id
+      : undefined;
+
   // First page only. This used to return every member, which made the team
   // page's cost grow without bound with the roster — the table pages through
   // GET /:id/members from here on. Sub-teams are likewise capped to a page
   // (the tab pages through GET /:id/sub-teams); `sub_team_count` carries the
   // real total for the tab badge.
-  const [team, memberPage, ancestors, subTeamPage] = await Promise.all([
-    c.env.DB.prepare("SELECT * FROM teams WHERE id = ?")
-      .bind(id)
-      .first<TeamRow>(),
+  const [memberPage, ancestors, subTeamPage] = await Promise.all([
     listTeamMembers(c.env.DB, c.env.APP_URL, id, {
       page: 1,
       limit: MEMBER_PAGE_SIZE,
+      visibleToUserId: viewerUserId,
     }),
     getTeamAncestors(c.env.DB, id),
     c.env.DB.prepare(
@@ -1349,8 +1362,6 @@ app.get("/:id", async (c) => {
         member_count: number;
       }>(),
   ]);
-
-  if (!team) return c.json({ error: "Not found" }, 404);
 
   // ancestors[0] is the team itself — slice it off and rewrite avatars.
   const ancestorChain = await Promise.all(
@@ -1433,6 +1444,7 @@ app.patch("/:id", async (c) => {
     role_permissions?: unknown;
     invite_registration_enabled?: boolean;
     allow_normal_user_join?: boolean;
+    restrict_member_list_for_members?: boolean;
   }>();
 
   if (body.avatar_url) {
@@ -1571,6 +1583,17 @@ app.patch("/:id", async (c) => {
     updates.push("allow_normal_user_join = ?");
     values.push(body.allow_normal_user_join ? 1 : 0);
   }
+  if (body.restrict_member_list_for_members !== undefined) {
+    if (!hasRole(member.role, "co-owner"))
+      return c.json(
+        {
+          error: "Only owners and co-owners can change member list visibility",
+        },
+        403,
+      );
+    updates.push("restrict_member_list_for_members = ?");
+    values.push(body.restrict_member_list_for_members ? 1 : 0);
+  }
   for (const field of [
     "profile_show_description",
     "profile_show_avatar",
@@ -1689,6 +1712,9 @@ interface MemberListOptions {
   /** Group slug. Resolved across the inheritance chain, so a label held via
    *  an ancestor team filters here exactly as it displays. */
   group?: string;
+  /** When member list hiding is active for a regular member viewer, only
+   *  owner/co-owner/admin and this user id are visible. */
+  visibleToUserId?: string;
 }
 
 /**
@@ -1710,17 +1736,29 @@ async function listTeamMembers(
   page: number;
   limit: number;
 }> {
-  const where: string[] = ["tm.team_id = ?"];
-  const args: unknown[] = [teamId];
+  const rowsWhere: string[] = ["tm.team_id = ?"];
+  const rowsArgs: unknown[] = [teamId];
+
+  const countWhere: string[] = ["tm.team_id = ?"];
+  const countArgs: unknown[] = [teamId];
+
+  if (opts.visibleToUserId !== undefined) {
+    rowsWhere.push(
+      "(tm.role IN ('owner', 'co-owner', 'admin') OR tm.user_id = ?)",
+    );
+    rowsArgs.push(opts.visibleToUserId);
+  }
 
   if (opts.query) {
     // LIKE with an escaped pattern — the input is user-supplied and % or _
     // would otherwise silently widen the match.
     const pattern = likePattern(opts.query);
-    where.push(
-      "(LOWER(u.display_name) LIKE LOWER(?) ESCAPE '\\' OR LOWER(u.username) LIKE LOWER(?) ESCAPE '\\')",
-    );
-    args.push(pattern, pattern);
+    const queryCond =
+      "(LOWER(u.display_name) LIKE LOWER(?) ESCAPE '\\' OR LOWER(u.username) LIKE LOWER(?) ESCAPE '\\')";
+    rowsWhere.push(queryCond);
+    rowsArgs.push(pattern, pattern);
+    countWhere.push(queryCond);
+    countArgs.push(pattern, pattern);
   }
 
   if (opts.group) {
@@ -1733,19 +1771,21 @@ async function listTeamMembers(
       return { members: [], total: 0, page: opts.page, limit: opts.limit };
     }
     const placeholders = chain.map(() => "?").join(", ");
-    where.push(
-      `EXISTS (
+    const groupCond = `EXISTS (
          SELECT 1 FROM team_member_groups tmg
            JOIN team_groups g ON g.id = tmg.group_id
           WHERE tmg.user_id = tm.user_id
             AND tmg.team_id IN (${placeholders})
             AND g.slug = ?
-       )`,
-    );
-    args.push(...chain, opts.group);
+       )`;
+    rowsWhere.push(groupCond);
+    rowsArgs.push(...chain, opts.group);
+    countWhere.push(groupCond);
+    countArgs.push(...chain, opts.group);
   }
 
-  const clause = where.join(" AND ");
+  const rowsClause = rowsWhere.join(" AND ");
+  const countClause = countWhere.join(" AND ");
   const offset = (opts.page - 1) * opts.limit;
 
   const [rows, countRow] = await Promise.all([
@@ -1754,11 +1794,11 @@ async function listTeamMembers(
         `SELECT tm.user_id, tm.role, tm.joined_at,
                 u.username, u.display_name, u.avatar_url
            FROM team_members tm JOIN users u ON u.id = tm.user_id
-          WHERE ${clause}
+          WHERE ${rowsClause}
           ORDER BY tm.joined_at ASC
           LIMIT ? OFFSET ?`,
       )
-      .bind(...args, opts.limit, offset)
+      .bind(...rowsArgs, opts.limit, offset)
       .all<{
         user_id: string;
         role: string;
@@ -1771,9 +1811,9 @@ async function listTeamMembers(
       .prepare(
         `SELECT COUNT(*) AS n
            FROM team_members tm JOIN users u ON u.id = tm.user_id
-          WHERE ${clause}`,
+          WHERE ${countClause}`,
       )
-      .bind(...args)
+      .bind(...countArgs)
       .first<{ n: number }>(),
   ]);
 
@@ -1811,6 +1851,20 @@ app.get("/:id/members", async (c) => {
   const eff = await teamAuthority(c, id);
   if (!eff) return c.json({ error: "Not found" }, 404);
 
+  const team = await c.env.DB.prepare(
+    "SELECT restrict_member_list_for_members FROM teams WHERE id = ?",
+  )
+    .bind(id)
+    .first<{ restrict_member_list_for_members: number }>();
+  if (!team) return c.json({ error: "Not found" }, 404);
+
+  const viewerUserId =
+    team.restrict_member_list_for_members === 1 &&
+    eff.role === "member" &&
+    !eff.elevated
+      ? actorFor(c).id
+      : undefined;
+
   const { page, limit } = readPage(
     c.req.query("page"),
     c.req.query("limit"),
@@ -1825,6 +1879,7 @@ app.get("/:id/members", async (c) => {
     // unbounded string is a cheap way to make that expensive.
     query: c.req.query("q")?.trim().slice(0, 64) || undefined,
     group: c.req.query("group")?.trim() || undefined,
+    visibleToUserId: viewerUserId,
   });
 
   return c.json(result);

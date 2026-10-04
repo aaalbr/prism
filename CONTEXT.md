@@ -52,6 +52,11 @@ on that exact team.
 **Role**:
 A member's standing within a team: `owner`, `co-owner`, `admin`, or `member`.
 
+**Restricted member list**:
+A team setting (`restrict_member_list_for_members`, owner/co-owner controlled)
+where viewers whose effective role is `member` can only see owners, co-owners,
+admins, and their own direct membership in the team's member lists and APIs.
+
 **Site floor**:
 A site-wide _minimum_ join requirement (2FA, verified email) that every team
 must enforce. Teams may require more, never less.
@@ -75,6 +80,12 @@ A user's link to one specific OAuth source account.
 **First-party app**:
 An OAuth app flagged as run by the instance operator; it skips the consent
 screen.
+
+**Remembered auto-authorization**:
+An explicit user choice ("Always authorize {app}") that allows subsequent OAuth
+authorization requests for the app to silently skip the consent screen, provided
+the effective requested scopes match the remembered grant exactly. Any scope
+change requires manual user confirmation again.
 
 **Official app**:
 An OAuth app the operator marks as officially endorsed (a trust badge). Distinct

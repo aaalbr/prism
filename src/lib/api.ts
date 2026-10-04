@@ -513,6 +513,7 @@ const buildApi = (request: ApiRequest, getToken: () => string | undefined) => ({
       alt_email_login: boolean | null;
       access_token_ttl_minutes: number | null;
       refresh_token_ttl_days: number | null;
+      notify_on_auto_authorization: boolean;
       gpg_require_2fa: boolean;
       profile_is_public: boolean;
       profile_show_display_name: boolean | null;
@@ -875,6 +876,13 @@ const buildApi = (request: ApiRequest, getToken: () => string | undefined) => ({
       "DELETE",
       `/oauth/consents/${encodeURIComponent(clientId)}`,
       undefined,
+      getToken(),
+    ),
+  updateConsent: (clientId: string, body: { auto_authorize?: boolean }) =>
+    request<{ message: string }>(
+      "PATCH",
+      `/oauth/consents/${encodeURIComponent(clientId)}`,
+      body,
       getToken(),
     ),
   revokeToken: (tokenId: string) =>
@@ -1538,6 +1546,8 @@ const buildApi = (request: ApiRequest, getToken: () => string | undefined) => ({
       /** Team management setting: may unrestricted accounts join via invite
        *  link? Direct adds by an admin are never subject to it. */
       allow_normal_user_join?: boolean;
+      /** Owner/co-owner setting: limit member list visibility for regular members */
+      restrict_member_list_for_members?: boolean;
       /** Owner-only. Only the keys present are overridden; drop a key to let
        *  it fall back to the site default. */
       role_permissions?: TeamRolePermissions;
@@ -2641,7 +2651,10 @@ export const api = createApiClient({
  *  concrete "global"/"china"; the client-side modes are resolved in the browser
  *  by the Captcha component. Absent on older servers → treated as "global". */
 export type TurnstileEndpointDirective =
-  "global" | "china" | "client_language" | "client_region";
+  | "global"
+  | "china"
+  | "client_language"
+  | "client_region";
 
 /** Which of the two configured Turnstile widgets minted a token. Sent back
  *  with the token so the server verifies it against the matching secret — the
@@ -2649,7 +2662,13 @@ export type TurnstileEndpointDirective =
 export type TurnstileVariant = "global" | "china";
 
 export type CaptchaProvider =
-  "none" | "turnstile" | "hcaptcha" | "recaptcha" | "pow" | "geetest" | "cap";
+  | "none"
+  | "turnstile"
+  | "hcaptcha"
+  | "recaptcha"
+  | "pow"
+  | "geetest"
+  | "cap";
 
 export type CapMode = "embedded" | "external";
 
@@ -2868,6 +2887,7 @@ export interface UserProfile {
   alt_email_login: number | null;
   access_token_ttl_minutes: number | null;
   refresh_token_ttl_days: number | null;
+  notify_on_auto_authorization: boolean;
   /** true (default) = gpg-login still asks for a TOTP code when the account
    *  has an enrolled authenticator; false = trust the GPG signature alone.
    *  See Security > GPG keys > "Require 2FA after GPG verification". */
@@ -3006,6 +3026,7 @@ export interface OAuthConsent {
   client_id: string;
   scopes: string[];
   granted_at: number;
+  auto_authorize: boolean;
   app: {
     name: string;
     description: string;
@@ -3118,6 +3139,8 @@ export interface Team {
   invite_registration_exemptions: { email_verification?: boolean };
   /** Whether unrestricted accounts may join through an invite link. */
   allow_normal_user_join: boolean;
+  /** Whether member list visibility is restricted for regular members. */
+  restrict_member_list_for_members: boolean;
   /** Set while a staged dissolution is in flight. */
   dissolving_at: number | null;
   /** Owner-only opt-in for member groups. Off by default; while off no read
@@ -3833,6 +3856,7 @@ export interface OAuthAuthorizeInfo {
   reauth_required: boolean;
   prompt_none_error: string | null;
   prior_consent_covers: boolean;
+  auto_authorize_eligible: boolean;
   user: UserProfile | null;
   requires_site_grant: boolean;
   site_scope_confirm_phrase: string | null;
@@ -3929,6 +3953,7 @@ export interface OAuthApproveBody {
   code_challenge_method?: string;
   nonce?: string;
   action: "approve" | "deny";
+  authorization_mode?: "once" | "always";
   totp_code?: string;
   passkey_verify_token?: string;
   confirm_text?: string;
@@ -4119,7 +4144,8 @@ export type NotificationRuleSendChannel =
   | { kind: "discord"; connection_id: string; level: NotificationLevel };
 
 export type NotificationRuleAction =
-  { type: "drop" } | { type: "send"; channels: NotificationRuleSendChannel[] };
+  | { type: "drop" }
+  | { type: "send"; channels: NotificationRuleSendChannel[] };
 
 export interface NotificationRulesetRule {
   id: string;

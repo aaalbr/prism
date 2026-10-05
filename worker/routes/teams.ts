@@ -2,11 +2,7 @@
 
 import { Hono } from "hono";
 import { randomId, randomBase64url } from "../lib/crypto";
-import {
-  encryptSecret,
-  hashSecret,
-  hashLookupCandidate,
-} from "../lib/secretCrypto";
+import { encryptSecret, hashLookupCandidate } from "../lib/secretCrypto";
 import { requireAuth, optionalAuth } from "../middleware/auth";
 import { computeIsVerified } from "../lib/domainVerify";
 import {
@@ -75,6 +71,11 @@ import {
 } from "../lib/teamGroups";
 import type { TeamGroupRow, TeamRolePermissions } from "../types";
 import { parseInviteExpiry } from "../lib/inviteExpiry";
+import {
+  canManageTeamInvite,
+  isInviteEnabled,
+  validateInviteMaxUses,
+} from "../lib/inviteManagement";
 
 type AppEnv = { Bindings: Env; Variables: Variables };
 const app = new Hono<AppEnv>();
@@ -631,6 +632,7 @@ interface InviteRow {
   created_at: number;
   allows_registration: number;
   allow_existing_members: number;
+  enabled: number;
 }
 
 interface InviteGroupRow {
@@ -676,7 +678,7 @@ app.get("/join/:token", optionalAuth, async (c) => {
   if (!tokenLookup)
     return c.json({ error: "Invite not found or expired" }, 404);
   const invite = await c.env.DB.prepare(
-    "SELECT * FROM team_invites WHERE (token = ? OR token = ?) AND expires_at > ?",
+    "SELECT * FROM team_invites WHERE (token = ? OR token = ?) AND expires_at > ? AND enabled = 1",
   )
     .bind(token, tokenLookup, now)
     .first<InviteRow>();
@@ -764,7 +766,7 @@ app.post("/join/:token", requireAuth, async (c) => {
   if (!tokenLookup)
     return c.json({ error: "Invite not found or expired" }, 404);
   const invite = await c.env.DB.prepare(
-    "SELECT * FROM team_invites WHERE (token = ? OR token = ?) AND expires_at > ?",
+    "SELECT * FROM team_invites WHERE (token = ? OR token = ?) AND expires_at > ? AND enabled = 1",
   )
     .bind(token, tokenLookup, now)
     .first<InviteRow>();
@@ -864,7 +866,7 @@ app.post("/join/:token", requireAuth, async (c) => {
 
   const claim = await c.env.DB.prepare(
     `UPDATE team_invites SET uses = uses + 1
-      WHERE token = ? AND expires_at > ?
+      WHERE token = ? AND expires_at > ? AND enabled = 1
         AND (max_uses = 0 OR uses < max_uses)`,
   )
     .bind(invite.token, now)
@@ -2763,7 +2765,7 @@ app.put("/:id/members/:userId/groups", async (c) => {
 
 // ─── Invites ──────────────────────────────────────────────────────────────────
 
-// List active invites for a team
+// List invites for a team, including expired rows so managers can extend them.
 app.get("/:id/invites", async (c) => {
   const id = c.req.param("id");
 
@@ -2771,7 +2773,6 @@ app.get("/:id/invites", async (c) => {
   if (!eff) return c.json({ error: "Not found" }, 404);
   if (!hasRole(eff.role, "admin")) return c.json({ error: "Forbidden" }, 403);
 
-  const now = Math.floor(Date.now() / 1000);
   const { page, limit, offset } = readPage(
     c.req.query("page"),
     c.req.query("limit"),
@@ -2780,9 +2781,9 @@ app.get("/:id/invites", async (c) => {
   const query = c.req.query("q")?.trim() ?? "";
 
   const where = query
-    ? "i.team_id = ? AND i.expires_at > ? AND LOWER(COALESCE(i.email, '')) LIKE LOWER(?) ESCAPE '\\'"
-    : "i.team_id = ? AND i.expires_at > ?";
-  const args: unknown[] = query ? [id, now, likePattern(query)] : [id, now];
+    ? "i.team_id = ? AND LOWER(COALESCE(i.email, '')) LIKE LOWER(?) ESCAPE '\\'"
+    : "i.team_id = ?";
+  const args: unknown[] = query ? [id, likePattern(query)] : [id];
 
   const [invites, countRow] = await Promise.all([
     c.env.DB.prepare(
@@ -2807,12 +2808,22 @@ app.get("/:id/invites", async (c) => {
     invites.results.map((invite) => invite.token),
   );
   return c.json({
-    invites: invites.results.map((invite) => ({
-      ...invite,
-      allows_registration: invite.allows_registration === 1,
-      allow_existing_members: invite.allow_existing_members === 1,
-      groups: inviteGroups.get(invite.token) ?? [],
-    })),
+    invites: invites.results.map((invite) => {
+      const canManage = canManageTeamInvite(
+        eff.role,
+        c.get("user").id,
+        invite.created_by,
+      );
+      return {
+        ...invite,
+        token: canManage ? invite.token : null,
+        enabled: isInviteEnabled(invite.enabled),
+        can_manage: canManage,
+        allows_registration: invite.allows_registration === 1,
+        allow_existing_members: invite.allow_existing_members === 1,
+        groups: inviteGroups.get(invite.token) ?? [],
+      };
+    }),
     total: countRow?.n ?? 0,
     page,
     limit,
@@ -2949,12 +2960,12 @@ app.post("/:id/invites", async (c) => {
     }
   }
   const token = randomBase64url(24);
-  const storedToken = await hashSecret(c.env, token);
+  const storedToken = token;
 
   await c.env.DB.batch([
     c.env.DB.prepare(
-      `INSERT INTO team_invites (token, team_id, role, created_by, email, max_uses, uses, expires_at, created_at, allows_registration, allow_existing_members)
-       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+      `INSERT INTO team_invites (token, team_id, role, created_by, email, max_uses, uses, expires_at, created_at, allows_registration, allow_existing_members, enabled)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 1)`,
     ).bind(
       storedToken,
       id,
@@ -2976,7 +2987,7 @@ app.post("/:id/invites", async (c) => {
 
   auditTeam(c, id, "team.invite.create", {
     resourceType: "team_invite",
-    resourceId: storedToken,
+    resourceId: `invite:${token.slice(0, 8)}`,
     metadata: {
       role,
       email: body.email ?? null,
@@ -3044,6 +3055,8 @@ app.post("/:id/invites", async (c) => {
         created_by_username: user.username,
         allows_registration: allowsRegistration === 1,
         allow_existing_members: body.allow_existing_members === true,
+        enabled: true,
+        can_manage: true,
         groups: inviteGroups.map((group) => ({
           id: group.id,
           slug: group.slug,
@@ -3057,15 +3070,149 @@ app.post("/:id/invites", async (c) => {
 });
 
 // Revoke an invite
+app.patch("/:id/invites/:token", async (c) => {
+  const id = c.req.param("id");
+  const token = c.req.param("token");
+  const user = c.get("user");
+  const eff = await teamAuthority(c, id);
+  if (!eff) return c.json({ error: "Not found" }, 404);
+  if (!hasRole(eff.role, "admin")) return c.json({ error: "Forbidden" }, 403);
+
+  const invite = await c.env.DB.prepare(
+    "SELECT * FROM team_invites WHERE token = ? AND team_id = ?",
+  )
+    .bind(token, id)
+    .first<InviteRow>();
+  if (!invite) return c.json({ error: "Invite not found" }, 404);
+  if (!canManageTeamInvite(eff.role, user.id, invite.created_by))
+    return c.json({ error: "Forbidden" }, 403);
+
+  const body = await c.req.json<{
+    email?: string | null;
+    max_uses?: number;
+    expires_at?: number;
+    enabled?: boolean;
+  }>();
+  const changes: Record<string, unknown> = {};
+  let email = invite.email;
+  let maxUses = invite.max_uses;
+  let expiresAt = invite.expires_at;
+  let enabled = isInviteEnabled(invite.enabled);
+  if (body.email !== undefined) {
+    email = body.email?.trim() || null;
+    changes.email = email;
+  }
+  if (body.max_uses !== undefined) {
+    const valid = validateInviteMaxUses(body.max_uses, invite.uses, 0);
+    if (!valid.ok)
+      return c.json(
+        { error: "max_uses must be a safe integer no lower than uses" },
+        400,
+      );
+    maxUses = valid.value;
+    if (invite.allows_registration === 1) {
+      const cap = await getConfigValue(
+        c.env.DB,
+        "team_invite_registration_max_uses_cap",
+      );
+      if (maxUses < 1 || maxUses > cap)
+        return c.json(
+          { error: `Usage limit must be between 1 and ${cap}` },
+          400,
+        );
+    }
+    changes.max_uses = maxUses;
+  }
+  if (body.expires_at !== undefined) {
+    const expiry = parseInviteExpiry(
+      body.expires_at,
+      Math.floor(Date.now() / 1000),
+    );
+    if (!expiry.ok) return c.json({ error: expiry.error }, 400);
+    expiresAt = expiry.expiresAt;
+    changes.expires_at = expiresAt;
+  }
+  if (body.enabled !== undefined) {
+    if (typeof body.enabled !== "boolean")
+      return c.json({ error: "enabled must be a boolean" }, 400);
+    enabled = body.enabled;
+    changes.enabled = enabled;
+  }
+  if (!Object.keys(changes).length)
+    return c.json({ error: "No editable fields provided" }, 400);
+  const assignments: string[] = [];
+  const values: unknown[] = [];
+  if (body.email !== undefined) {
+    assignments.push("email = ?");
+    values.push(email);
+  }
+  if (body.max_uses !== undefined) {
+    assignments.push("max_uses = ?");
+    values.push(maxUses);
+  }
+  if (body.expires_at !== undefined) {
+    assignments.push("expires_at = ?");
+    values.push(expiresAt);
+  }
+  if (body.enabled !== undefined) {
+    assignments.push("enabled = ?");
+    values.push(enabled ? 1 : 0);
+  }
+  const useGuard =
+    body.max_uses !== undefined && maxUses !== 0 ? " AND uses <= ?" : "";
+  if (useGuard) values.push(maxUses);
+  const updated = await c.env.DB.prepare(
+    `UPDATE team_invites SET ${assignments.join(", ")} WHERE token = ? AND team_id = ?${useGuard}`,
+  )
+    .bind(...values, token, id)
+    .run();
+  if (!updated.meta.changes)
+    return c.json(
+      { error: "Invite usage changed; refresh and try again" },
+      409,
+    );
+  auditTeam(
+    c,
+    id,
+    enabled === isInviteEnabled(invite.enabled)
+      ? "team.invite.update"
+      : enabled
+        ? "team.invite.enable"
+        : "team.invite.disable",
+    {
+      resourceType: "team_invite",
+      resourceId: `invite:${token.slice(0, 8)}`,
+      metadata: { changes },
+    },
+  );
+  return c.json({
+    invite: {
+      ...invite,
+      email,
+      max_uses: maxUses,
+      expires_at: expiresAt,
+      enabled,
+    },
+  });
+});
+
 app.delete("/:id/invites/:token", async (c) => {
   const id = c.req.param("id");
   const token = c.req.param("token");
 
+  const user = c.get("user");
   const eff = await teamAuthority(c, id);
   if (!eff) return c.json({ error: "Not found" }, 404);
   if (!hasRole(eff.role, "admin")) return c.json({ error: "Forbidden" }, 403);
 
   const tokenLookup = await hashLookupCandidate(c.env, token);
+  const invite = await c.env.DB.prepare(
+    "SELECT created_by FROM team_invites WHERE (token = ? OR token = ?) AND team_id = ?",
+  )
+    .bind(token, tokenLookup ?? token, id)
+    .first<{ created_by: string }>();
+  if (invite && !canManageTeamInvite(eff.role, user.id, invite.created_by))
+    return c.json({ error: "Forbidden" }, 403);
   // For revoke, missing/suspicious tokens are silently treated as a no-op
   // delete — caller already gated by team admin role above, so a probe
   // here can't be used to enumerate invites.
